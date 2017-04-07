@@ -1,0 +1,17 @@
+<%# vim: set filetype=eruby : -%>
+#
+# Managed by puppet ::misomongo
+#
+127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4
+::1         localhost localhost.localdomain localhost6 localhost6.localdomain6
+<%= @ipaddress %> <%= @fqdn %> <%= @hostname %> <%= @server_name %>
+<% if @server_name == @server1_name -%>
+<%= @server2_ip %> <%= @server2_name %>
+<%= @server3_ip %> <%= @server3_name %>
+<% elsif @server_name == @server2_name -%>
+<%= @server1_ip %> <%= @server1_name %>
+<%= @server3_ip %> <%= @server3_name %>
+<% elsif @server_name == @server3_name -%>
+<%= @server1_ip %> <%= @server1_name %>
+<%= @server2_ip %> <%= @server2_name %>
+<% end -%>

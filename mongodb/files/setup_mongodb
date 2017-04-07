@@ -1,0 +1,338 @@
+#!/bin/ksh
+
+logging=""	# clear = no logging, value = logging
+build_log="/tmp/mongo_$$.log"
+
+log()
+{
+	if [ $# -gt 0 ]
+	 then
+		if [ "$logging" ]
+		 then
+			printf "%s -- %s\n" "`date`" "$*" >>$build_log
+		fi
+	 else
+		log "+++++++++"
+		while read d
+		 do
+			log "$d"
+		done
+		log "---------"
+	fi
+}
+
+log "startup --- $0 -- $*"
+service mongod stop
+
+
+conf=/etc/mongodb.conf
+
+tmp_fn=/tmp/work$$.js
+tmp_out=/tmp/work$$.log
+rep_set=tejas
+
+mod_conf()
+{
+	cp $conf ${conf}.$$
+	getent hosts `hostname` | read my_ip d
+
+	cat <<EOF >$conf
+## for host $host
+replSet=$rep_set
+fork=true
+logappend=true
+port=$port
+syncdelay=5
+
+pidfilepath=/var/run/mongodb/mongodb.pid
+logpath=/var/log/mongodb/mongodb.log
+dbpath=/var/lib/mongodb
+journal=true
+nohttpinterface=true
+
+bind_ipconf=$my_ip
+EOF
+}
+
+wait_for_db_online()
+{
+	log "wait_for_db_online ($*)"
+
+	echo "rs.status()" >${tmp_fn}
+	mongo --host $1 --port $2 ${tmp_fn}
+	rc=$?
+	while [ $rc -ne 0 ]
+	 do
+		sleep 5
+		mongo --host $1 --port $2 ${tmp_fn}
+		rc=$?
+	done
+	log "wait_for_db_online = $rc"
+	return $rc
+}
+
+wait_for_rs_ready()
+{
+	log "wait_for_rs_ready ($*)"
+
+	echo "printjson(rs.status())" >${tmp_fn}
+	ok=1
+	while [ $ok -ne 0 ]
+	 do
+		sleep 10
+		mongo --host $1 --port $2 ${tmp_fn} >$tmp_out 2>&1
+		rc=$?
+		st=`egrep '"state" : ' $tmp_out | wc -l`
+		ok=`egrep '"state" : ' $tmp_out | egrep ': 1,|: 2,' | wc -l`
+
+		# All entries must show OK for us to leave cleanly.
+		if [ $st -eq 0 -o $ok -eq 0 -o $st -ne $ok ]
+		 then
+			sleep 10
+			ok=1
+		 else
+			ok=0
+		fi
+	done
+	log "wait_for_rs_ready = $ok"
+	return $ok
+}
+
+wait_for_db_ready()
+{
+	log "wait_for_db_ready ($*)"
+
+	echo "printjson(db.isMaster())" >${tmp_fn}
+	ok=1
+	while [ $ok -ne 0 ]
+	 do
+		mongo --host $host --port $port ${tmp_fn} >$tmp_out
+		grep -q '"ok" : 1' $tmp_out
+		ok=$?
+		sleep 3
+	done
+	log "wait_for_db_ready = $ok"
+	return $ok
+}
+
+setup_db()
+{
+	log "setup_db ($*)"
+
+	service mongod stop
+	mod_conf
+	service mongod start ""
+	rc=$?
+	if [ $rc -eq 0 ]
+	 then
+		wait_for_db_online $host $port
+		wait_for_db_ready
+		rc=$?
+	fi
+	log "setup_db = $rc"
+	return $rc
+}
+
+#
+# Create a user with simple attributes
+# $1 = user name:pswd
+# $2 = roles value
+# $3 = database name
+
+# Globals:
+# ${tmp_fn} = tmp work file name
+#
+add_simple_user()
+{
+	log "add_simple_user ($*)"
+
+	typeset usr=""
+	typeset pswd=""
+
+	echo $1 | awk -F: '{print $1,$2;}' | read usr pswd
+	cat <<EOF >${tmp_fn}
+db.addUser(
+	{
+		user: "$usr",
+		pwd: "$pswd",
+		roles: ["$2"]
+	}
+)
+EOF
+	mongo --host $host --port $port $db_name ${tmp_fn}
+	rc=$?
+	rm ${tmp_fn}
+	log "add_simple_user = $rc"
+	return $rc
+}
+
+
+#
+# $host = host name
+# $port = port no
+# $db_name = db name
+# $admin_data = admin user data (name_pswd)
+# $user_data = user data (name:pswd)
+#
+setup_sa()
+{
+	log "setup_sa ($*)"
+
+	#
+	# Create the replication set
+	#
+	cat <<EOF >${tmp_fn}
+config = {
+	"_id" : "$rep_set",
+	"members" : [
+		{"_id" : 0, "host":"$host:$port"}
+	]
+}
+rs.initiate(config)
+EOF
+	mongo --host $host --port $port ${tmp_fn}
+	rc=$?
+
+	if [ $rc -eq 0 ]
+	 then
+		wait_for_rs_ready $host $port
+		rc=$?
+	fi
+	log "setup_sa = $rc"
+	return $rc
+}
+
+
+setup_ha()
+{
+	log "setup_ha ($*)"
+
+	wait_for_db_online $1 $2
+	echo "printjson(rs.add(\"$1:$2\"))" >${tmp_fn}
+	mongo --host $host --port $port ${tmp_fn}
+	rc=$?
+	if [ $rc -eq 0 ]
+	 then
+		wait_for_rs_ready $1 $2
+		rc=$?
+	fi
+	log "setup_ha = $rc"
+	return $rc
+}
+
+
+add_users()
+{
+	log "add_users ($*)"
+
+	rc=0
+
+	#
+	# Create the admin user
+	#
+	if [ "$admin_data" != "" ]
+	 then
+		add_simple_user $admin_data "userAdminAnyDatabase"
+		rc=$?
+	fi
+
+	if [ $rc -eq 0 ]
+	 then
+		#
+		# Create the non-admin user
+		#
+		if [ "$user_data" != "" ]
+		 then
+			add_simple_user $user_data "readWrite"
+			rc=$?
+		fi
+	fi
+	log "add_users = $rc"
+	return $rc
+}
+
+
+#########################################################################################
+#########################################################################################
+###
+###  Main section
+###
+
+while getopts h:p:s:n:u:a:d: opt
+ do
+	case "$opt" in
+	  h )
+		ha=$OPTARG
+		;;
+	  p )
+		port=$OPTARG
+		;;
+	  s )
+		server_list=$OPTARG
+		;;
+	  n )
+		host=$OPTARG
+		;;
+	  u )
+		user_data=$OPTARG
+		;;
+	  a )
+		admin_data=$OPTARG
+		;;
+	  d )
+		db_name=$OPTARG
+		;;
+	esac
+done
+
+if [ "$ha" = "false" ]
+ then
+	setup_db
+	rc=$?
+	if [ $rc -eq 0 ]
+	 then
+		setup_sa
+		rc=$?
+	fi
+	if [ $rc -eq 0 ]
+	 then
+		add_users
+		rc=$?
+	fi
+ else
+	setup_db 2>&1 | log
+	echo $server_list | awk -F, '{for (i=1; i<=NF; i++) printf("%s ", $i);}' | read host_list
+	log "host=$host"
+	log "host_list=$host_list"
+
+	last_host=""
+	for i in $host_list
+	 do
+		last_host=$i
+	done
+
+	# The last built host will be our primary
+	# This gives the others a chance to get started before
+	# we try to contact them.
+	#
+	if [ $host = $last_host ]
+	 then
+		setup_sa 2>&1 | log
+		for i in $host_list
+		 do
+			log "processing host: $i"
+
+			# Don't add ourself.
+			#
+			if [ $i != $host ]
+			 then
+				setup_ha $i $port 2>&1 | log
+			fi
+		done
+		add_users 2>&1 | log
+		rc=$?
+	fi
+fi
+
+log "$0 = $rc"
+exit $rc
